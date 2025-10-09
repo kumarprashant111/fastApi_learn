@@ -1,4 +1,3 @@
-# src/app/models.py
 from __future__ import annotations
 from datetime import date, datetime
 from enum import Enum
@@ -6,7 +5,7 @@ from typing import Optional, List
 
 from sqlalchemy import (
     String, Integer, Float, Date, DateTime, ForeignKey, Enum as SAEnum,
-    Boolean, UniqueConstraint, text
+    Boolean, UniqueConstraint, text, func
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -62,11 +61,11 @@ class Contract(Base):
     start_date: Mapped[date]
     end_date: Mapped[date]
     negotiated_power_kw: Mapped[Optional[float]] = mapped_column()
-    status: Mapped[ContractStatus] = mapped_column(SAEnum(ContractStatus), default=ContractStatus.UNDER_CONTRACT)
+    status: Mapped[ContractStatus] = mapped_column(SAEnum(ContractStatus, name="contractstatus"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False),
         nullable=False,
-        server_default=text("now()")  # ✅ server default
+        server_default=text("now()")
     )
 
     customer: Mapped[Customer] = relationship(lazy="selectin")
@@ -82,7 +81,7 @@ class AncillaryContract(Base):
     __tablename__ = "ancillary_contracts"
     id: Mapped[int] = mapped_column(primary_key=True)
     contract_id: Mapped[int] = mapped_column(ForeignKey("contracts.id"), index=True)
-    type: Mapped[AncillaryType] = mapped_column(SAEnum(AncillaryType))
+    type: Mapped[AncillaryType] = mapped_column(SAEnum(AncillaryType, name="ancillarytype"))
     unit_price: Mapped[Optional[float]] = mapped_column()
 
     contract: Mapped[Contract] = relationship(back_populates="ancillary_contracts", lazy="selectin")
@@ -96,21 +95,17 @@ class QuoteEffectiveDays(int, Enum):
 
 
 class RecontractEstimate(Base):
-    """
-    Header record for a re-contract estimate request.
-    One header can expand to multiple 'capacity scenarios' projects (0 + up to 3).
-    """
     __tablename__ = "recontract_estimates"
     id: Mapped[int] = mapped_column(primary_key=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"), index=True)
     plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"))
     desired_quote_date: Mapped[date]
-    quote_effective_days: Mapped[QuoteEffectiveDays] = mapped_column(SAEnum(QuoteEffectiveDays))
+    quote_effective_days: Mapped[QuoteEffectiveDays] = mapped_column(SAEnum(QuoteEffectiveDays, name="quoteeffectivedays"))
     remarks: Mapped[Optional[str]] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False),
         nullable=False,
-        server_default=text("now()")  # ✅ server default to fix your error
+        server_default=text("now()")
     )
 
     customer: Mapped[Customer] = relationship(lazy="selectin")
@@ -132,9 +127,6 @@ class RecontractSupplyPoint(Base):
 
 
 class RecontractPlant(Base):
-    """
-    Up to 3 capacity scenarios + default 0 capacity.
-    """
     __tablename__ = "recontract_plants"
     id: Mapped[int] = mapped_column(primary_key=True)
     estimate_id: Mapped[int] = mapped_column(ForeignKey("recontract_estimates.id"), index=True)
@@ -142,3 +134,72 @@ class RecontractPlant(Base):
     ppa_unit_price_yen_per_kwh: Mapped[Optional[float]]
 
     estimate: Mapped[RecontractEstimate] = relationship(back_populates="plants", lazy="selectin")
+
+
+# --- PPA (bundle / project) -----------------------------------------------
+
+class VoltageLevel(str, Enum):
+   HIGH = "HIGH"
+   EXTRA_HIGH = "EXTRA_HIGH"   # <-- must match DB
+   LOW = "LOW"
+
+class QuoteStatus(str, Enum):
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    PRICED = "PRICED"
+    EXCEL_READY = "EXCEL_READY"
+
+class OfferStatus(str, Enum):
+    NONE = "NONE"
+    OFFERED = "OFFERED"
+    WON = "WON"
+    LOST = "LOST"
+
+class PpaBundle(Base):
+    __tablename__ = "ppa_bundles"
+    id: Mapped[int] = mapped_column(primary_key=True)  # Summary number
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
+    agency_id: Mapped[Optional[int]] = mapped_column(ForeignKey("agencies.id"))
+    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"))
+    voltage: Mapped[VoltageLevel] = mapped_column(SAEnum(VoltageLevel, name="voltagelevel"))
+    area: Mapped[str] = mapped_column(String(32))  # e.g., KANTO
+    prev_supplier_plan: Mapped[Optional[str]] = mapped_column(String(120))
+
+    contract_start_date: Mapped[Optional[date]]
+    quote_valid_days: Mapped[Optional[int]]
+    requested_at: Mapped[Optional[date]]
+    request_due_date: Mapped[Optional[date]]
+
+    quote_status: Mapped[QuoteStatus] = mapped_column(SAEnum(QuoteStatus, name="ppaqstatus"), default=QuoteStatus.DRAFT)
+    offer_status: Mapped[OfferStatus] = mapped_column(SAEnum(OfferStatus, name="ppaofferstatus"), default=OfferStatus.NONE)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    customer: Mapped["Customer"] = relationship(lazy="selectin")
+    agency: Mapped[Optional["Agency"]] = relationship(lazy="selectin")
+    plan: Mapped["Plan"] = relationship(lazy="selectin")
+
+    projects: Mapped[List["PpaProject"]] = relationship(back_populates="bundle", cascade="all,delete-orphan", lazy="selectin")
+    supply_points: Mapped[List["PpaSupplyPoint"]] = relationship(back_populates="bundle", cascade="all,delete-orphan", lazy="selectin")
+
+class PpaProject(Base):
+    __tablename__ = "ppa_projects"
+    id: Mapped[int] = mapped_column(primary_key=True)  # Project number
+    bundle_id: Mapped[int] = mapped_column(ForeignKey("ppa_bundles.id"), index=True)
+    capacity_mw: Mapped[float]
+    ppa_unit_price_yen_per_kwh: Mapped[Optional[float]]
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    bundle: Mapped["PpaBundle"] = relationship(back_populates="projects", lazy="selectin")
+
+class PpaSupplyPoint(Base):
+    __tablename__ = "ppa_supply_points"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bundle_id: Mapped[int] = mapped_column(ForeignKey("ppa_bundles.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    address: Mapped[Optional[str]] = mapped_column(String(300))
+    supply_point_number: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    contract_kw: Mapped[Optional[float]]
+
+    bundle: Mapped["PpaBundle"] = relationship(back_populates="supply_points", lazy="selectin")
