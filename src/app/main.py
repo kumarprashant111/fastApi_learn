@@ -1,12 +1,15 @@
+from __future__ import annotations
 from fastapi import FastAPI
-from app.api.items import router as items_router
-from app.settings import settings
-app = FastAPI(title=settings.app_name, debug=settings.debug)
 
+from app.api.projects import router as projects_router
+# keep your existing recontract endpoints if you have them:
+from app.api.recontract import router as recontract_router
 
-app = FastAPI(title="FastAPI with uv")
-app.include_router(items_router)
+app = FastAPI(title="FastAPI with uv (Postgres)")
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+app.include_router(projects_router)
+app.include_router(recontract_router)
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
