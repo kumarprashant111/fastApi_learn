@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 
 class QuotationListItem(BaseModel):
+    # BizQ core
     id: int
     tender_number: str
 
@@ -43,6 +44,12 @@ class QuotationListItem(BaseModel):
     # "YYYY-MM-DD HH:MM"
     last_updated: Optional[str] = None
     has_quotation_file: bool
+
+    # --- Additions/changes for PPA screen ---
+    summary_number: str                     # まとめ番号（= tender_number for now）
+    project_count: int                      # 案件数（distinct project ids）
+    contract_power_kw: float                # 契約電力（sum of contract_kw）
+    expiration_date: Optional[date] = None  # 有効期限（date only）
 
     class Config:
         from_attributes = True
