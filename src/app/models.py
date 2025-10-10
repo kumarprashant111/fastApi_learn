@@ -1,3 +1,4 @@
+# src/app/models.py
 from __future__ import annotations
 from datetime import date, datetime
 from enum import Enum
@@ -139,9 +140,9 @@ class RecontractPlant(Base):
 # --- PPA (bundle / project) -----------------------------------------------
 
 class VoltageLevel(str, Enum):
-   HIGH = "HIGH"
-   EXTRA_HIGH = "EXTRA_HIGH"   # <-- must match DB
-   LOW = "LOW"
+    HIGH = "HIGH"
+    EXTRA_HIGH = "EXTRA_HIGH"   # <-- must match DB
+    LOW = "LOW"
 
 class QuoteStatus(str, Enum):
     DRAFT = "DRAFT"
@@ -180,8 +181,16 @@ class PpaBundle(Base):
     agency: Mapped[Optional["Agency"]] = relationship(lazy="selectin")
     plan: Mapped["Plan"] = relationship(lazy="selectin")
 
-    projects: Mapped[List["PpaProject"]] = relationship(back_populates="bundle", cascade="all,delete-orphan", lazy="selectin")
-    supply_points: Mapped[List["PpaSupplyPoint"]] = relationship(back_populates="bundle", cascade="all,delete-orphan", lazy="selectin")
+    projects: Mapped[List["PpaProject"]] = relationship(
+        back_populates="bundle",
+        cascade="all,delete-orphan",
+        lazy="selectin"
+    )
+    supply_points: Mapped[List["PpaSupplyPoint"]] = relationship(
+        back_populates="bundle",
+        cascade="all,delete-orphan",
+        lazy="selectin"
+    )
 
 class PpaProject(Base):
     __tablename__ = "ppa_projects"
@@ -193,13 +202,29 @@ class PpaProject(Base):
 
     bundle: Mapped["PpaBundle"] = relationship(back_populates="projects", lazy="selectin")
 
+    # NEW: access SPs under this project
+    supply_points: Mapped[List["PpaSupplyPoint"]] = relationship(
+        back_populates="project",
+        lazy="selectin"
+    )
+
 class PpaSupplyPoint(Base):
     __tablename__ = "ppa_supply_points"
     id: Mapped[int] = mapped_column(primary_key=True)
     bundle_id: Mapped[int] = mapped_column(ForeignKey("ppa_bundles.id"), index=True)
+
+    # NEW: link SP to a specific project (nullable so legacy rows still valid)
+    project_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ppa_projects.id"),
+        index=True,
+        nullable=True
+    )
+
     name: Mapped[str] = mapped_column(String(200))
     address: Mapped[Optional[str]] = mapped_column(String(300))
     supply_point_number: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     contract_kw: Mapped[Optional[float]]
 
     bundle: Mapped["PpaBundle"] = relationship(back_populates="supply_points", lazy="selectin")
+    # NEW relationship back to project
+    project: Mapped[Optional["PpaProject"]] = relationship(back_populates="supply_points", lazy="selectin")
