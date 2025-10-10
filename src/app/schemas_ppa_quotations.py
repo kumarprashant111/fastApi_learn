@@ -1,38 +1,9 @@
-# src/app/schemas_projects.py
 from __future__ import annotations
-from datetime import date, datetime
-from typing import List, Optional
+from datetime import date
+from typing import Optional, List
 from pydantic import BaseModel
 
 
-# -------------------------
-# Existing projects list row
-# -------------------------
-class ProjectListRow(BaseModel):
-    id: int                                  # bundle id (summary number)
-    project_numbers: List[int]               # child project ids
-    plan: str
-    customer: str
-    agency: Optional[str] = None
-    area: str
-    supply_point_count: int
-    contracted_power_kw: float
-    annual_usage_kwh: float                  # placeholder (0 for now)
-    contract_start_date: Optional[date] = None
-    expiration_date: Optional[date] = None   # not modeled; leave None
-    last_renewed_at: Optional[datetime] = None  # not modeled; leave None
-    quotation_requested_at: Optional[date] = None
-    requested_preparation_date: Optional[date] = None
-    quote_status: Optional[str] = None
-    offer_status: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-# ---------------------------------
-# BizQ-like Quotation list response
-# ---------------------------------
 class QuotationListItem(BaseModel):
     id: int
     tender_number: str
@@ -41,7 +12,7 @@ class QuotationListItem(BaseModel):
 
     plan_id: int
     plan_name_en: str
-    plan_name_jp: str
+    plan_name_jp: Optional[str] = None
 
     sales_agent_id: Optional[int] = None
     sales_agent_name: Optional[str] = None
@@ -50,25 +21,31 @@ class QuotationListItem(BaseModel):
     region_name_en: Optional[str] = None
     region_name_jp: Optional[str] = None
 
-    quote_request_date: Optional[str] = None         # ISO date string
-    last_date_for_quotation: Optional[str] = None    # ISO date string
-    quote_valid_until: Optional[str] = None          # e.g. "2025-11-02 (30日)"
-    contract_start_date: Optional[str] = None        # ISO date string
+    quote_request_date: Optional[date] = None
+    last_date_for_quotation: Optional[date] = None
+    # e.g. "2025-11-02 (30日)"
+    quote_valid_until: Optional[str] = None
+
+    contract_start_date: Optional[date] = None
 
     num_of_spids: int
     peak_demand: Optional[float] = None
     annual_usage: Optional[float] = None
 
-    pricing_status_id: Optional[int] = None
-    pricing_status_en: Optional[str] = None
-    pricing_status_jp: Optional[str] = None
+    pricing_status_id: int
+    pricing_status_en: str
+    pricing_status_jp: str
 
-    offer_status_id: Optional[int] = None
-    offer_status_en: Optional[str] = None
-    offer_status_jp: Optional[str] = None
+    offer_status_id: int
+    offer_status_en: str
+    offer_status_jp: str
 
-    last_updated: Optional[str] = None               # "YYYY-MM-DD HH:MM"
-    has_quotation_file: bool = False
+    # "YYYY-MM-DD HH:MM"
+    last_updated: Optional[str] = None
+    has_quotation_file: bool
+
+    class Config:
+        from_attributes = True
 
 
 class QuotationListResponse(BaseModel):
