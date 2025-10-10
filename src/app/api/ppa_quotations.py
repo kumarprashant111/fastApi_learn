@@ -12,7 +12,8 @@ from app.db import get_session
 from app.models import (
     PpaBundle, PpaProject, PpaSupplyPoint, Plan, Customer, Agency
 )
-from app.schemas_projects import ProjectListRow
+from app.schemas_ppa_quotations import ProjectListRow
+
 
 # Renamed section + base path
 router = APIRouter(prefix="/ppa_quotations", tags=["ppa_quotations"])
