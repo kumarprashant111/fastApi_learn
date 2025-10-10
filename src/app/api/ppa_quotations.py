@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Optional, List, Tuple
 
+from fastapi import APIRouter, Depends, HTTPException, Query
 import sqlalchemy as sa
 from sqlalchemy import func
-from sqlalchemy.dialects import postgresql as pg
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import APIRouter, Depends, Query, HTTPException
 
 from app.db import get_session
 from app.models import (
@@ -22,60 +21,58 @@ from app.models import (
 from app.schemas_ppa_quotations import (
     PpaQuotationListItem,
     PpaQuotationListResponse,
-    PpaProjectBrief,
-    PpaQuotationDetailResponse,
+    PpaQuotationProject,
+    PpaQuotationDetail,
 )
 
 router = APIRouter(prefix="/ppa_quotations", tags=["ppa_quotations"])
 
-# --- helpers --------------------------------------------------------------
 
-def _status_maps() -> Tuple[dict, dict]:
-    # Map your enum values to the BizQ wording
-    pricing_map = {
-        "DRAFT":        (1, "pending", "保留中"),
-        "PRELIMINARY":  (2, "preliminary", "暫定"),
-        "FINAL":        (3, "finalized", "確定"),
-    }
-    offer_map = {
-        "NONE":     (1, "pending", "保留中"),
-        "SENT":     (2, "sent", "送付済み"),
-        "ACCEPTED": (3, "accepted", "受領"),
-        "REJECTED": (4, "rejected", "拒否"),
-    }
-    return pricing_map, offer_map
+# -------------------------------
+# Helpers
+# -------------------------------
 
-
-def _region_from_area(area: Optional[str]) -> Tuple[int, str, str]:
-    # Simple area→region mapping; adjust as needed
+def _region_from_area(area: Optional[str]) -> tuple[int, str, str]:
+    """
+    Very lightweight area->region mapping until you model a Regions table.
+    """
     if not area:
         return 0, "Unknown", "不明"
-    area_up = area.upper()
-    if area_up in {"KANTO", "TOKYO"}:
-        return 3, "Tokyo", "東京"
-    if area_up in {"TOHOKU"}:
-        return 2, "Tohoku", "東北"
-    return 1, area.title(), area  # generic fallback
+    a = area.upper()
+    mapping = {
+        "TOKYO": (3, "Tokyo", "東京"),
+        "KANTO": (3, "Tokyo", "東京"),
+        "TOHOKU": (2, "Tohoku", "東北"),
+        "KANSAI": (4, "Kansai", "関西"),
+        "CHUBU": (5, "Chubu", "中部"),
+        "HOKKAIDO": (1, "Hokkaido", "北海道"),
+        "KYUSHU": (9, "Kyushu", "九州"),
+        "CHUGOKU": (6, "Chugoku", "中国"),
+        "SHIKOKU": (7, "Shikoku", "四国"),
+        "HOKURIKU": (8, "Hokuriku", "北陸"),
+    }
+    return mapping.get(a, (3, "Tokyo", "東京"))
 
 
-def _summary_number(bundle_id: int) -> str:
-    # Your BizQ shows like BQ2025..., here we keep the earlier PPA0000... scheme
+def _format_quote_valid_until(base: Optional[date], days: Optional[int]) -> tuple[Optional[str], Optional[date]]:
+    """
+    Compute (display_label, expiration_date) purely in Python.
+    - display_label example: "2025-11-02 (30日)"
+    """
+    if not base or not days:
+        return None, None
+    d = int(days)
+    exp = base + timedelta(days=d)
+    return f"{exp:%Y-%m-%d} ({d}日)", exp
+
+
+def _tender_number(bundle_id: int) -> str:
     return f"PPA{bundle_id:08d}"
 
 
-def _valid_until_string(req_date: Optional[date], days: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (quote_valid_until display, expiration_date yyyy-mm-dd)
-    e.g. ("2025-08-30 (60日)", "2025-08-30")
-    """
-    if not req_date or not days:
-        return None, None
-    exp = req_date + timedelta(days=int(days))
-    exp_str = exp.isoformat()
-    return f"{exp_str} ({int(days)}日)", exp_str
-
-
-# --- LIST --------------------------------------------------------------
+# -------------------------------
+# List endpoint (BizQ-like envelope)
+# -------------------------------
 
 @router.get("", response_model=PpaQuotationListResponse)
 async def list_ppa_quotations(
@@ -83,27 +80,26 @@ async def list_ppa_quotations(
     page: int = Query(1, ge=1),
     rows: int = Query(20, ge=1, le=200),
     sort_by: str = Query("updated_at"),
-    sort_order: str = Query("desc", regex="^(asc|desc)$"),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     customer_id: Optional[int] = None,
     agency_id: Optional[int] = None,
-    area: Optional[str] = None,
+    region: Optional[str] = None,   # optional text filter - maps to area
+    quote_status: Optional[str] = None,
     offer_status: Optional[str] = None,
-    pricing_status: Optional[str] = None,
 ):
     """
-    BizQ-style list with pagination + counts.
+    Returns:
+      {
+        "total_count": <all bundles count>,
+        "filtered_count": <count after filters>,
+        "data": [ PpaQuotationListItem, ... ]
+      }
     """
+    # total_count (no filters)
+    total_stmt = sa.select(func.count(PpaBundle.id))
+    total_count = (await session.execute(total_stmt)).scalar_one()
 
     # base selectable
-    empty_int_array = sa.text("ARRAY[]::int[]")
-    proj_ids_expr = func.coalesce(
-        sa.cast(func.array_agg(sa.distinct(PpaProject.id)), pg.ARRAY(sa.Integer)),
-        empty_int_array,
-    ).label("proj_ids")
-
-    sum_kw_expr = func.coalesce(func.sum(PpaSupplyPoint.contract_kw), 0.0).label("sum_kw")
-
-    # columns we need in Python for formatting
     stmt = (
         sa.select(
             PpaBundle.id.label("bundle_id"),
@@ -113,146 +109,167 @@ async def list_ppa_quotations(
             Agency.id.label("agency_id"),
             Agency.name.label("agency_name"),
             PpaBundle.area,
-            PpaBundle.requested_at,
-            PpaBundle.request_due_date,
-            PpaBundle.quote_valid_days,
             PpaBundle.contract_start_date,
+            PpaBundle.requested_at,          # quote_request_date
+            PpaBundle.request_due_date,      # last_date_for_quotation
+            PpaBundle.quote_valid_days,
             PpaBundle.quote_status,
             PpaBundle.offer_status,
-            PpaBundle.updated_at,
-            func.count(PpaSupplyPoint.id).label("sp_count"),
-            sum_kw_expr,
-            proj_ids_expr,
+            PpaBundle.updated_at.label("last_updated"),
+            func.count(sa.distinct(PpaProject.id)).label("project_count"),
+            func.count(sa.distinct(PpaSupplyPoint.id)).label("sp_count"),
+            func.coalesce(func.sum(PpaSupplyPoint.contract_kw), 0.0).label("sum_kw"),
         )
         .join(Plan, Plan.id == PpaBundle.plan_id)
         .join(Customer, Customer.id == PpaBundle.customer_id)
         .outerjoin(Agency, Agency.id == PpaBundle.agency_id)
-        .outerjoin(PpaSupplyPoint, PpaSupplyPoint.bundle_id == PpaBundle.id)
         .outerjoin(PpaProject, PpaProject.bundle_id == PpaBundle.id)
+        .outerjoin(PpaSupplyPoint, PpaSupplyPoint.bundle_id == PpaBundle.id)
         .group_by(
-            PpaBundle.id, Plan.id, Plan.name, Customer.name, Agency.id, Agency.name,
-            PpaBundle.area, PpaBundle.requested_at, PpaBundle.request_due_date,
-            PpaBundle.quote_valid_days, PpaBundle.contract_start_date,
-            PpaBundle.quote_status, PpaBundle.offer_status, PpaBundle.updated_at,
+            PpaBundle.id,
+            Plan.id, Plan.name,
+            Customer.name,
+            Agency.id, Agency.name,
+            PpaBundle.area,
+            PpaBundle.contract_start_date,
+            PpaBundle.requested_at,
+            PpaBundle.request_due_date,
+            PpaBundle.quote_valid_days,
+            PpaBundle.quote_status,
+            PpaBundle.offer_status,
+            PpaBundle.updated_at,
         )
     )
 
-    # filters (mirror on filtered_count)
+    # filters
     if customer_id is not None:
         stmt = stmt.where(PpaBundle.customer_id == customer_id)
     if agency_id is not None:
         stmt = stmt.where(PpaBundle.agency_id == agency_id)
-    if area:
-        stmt = stmt.where(PpaBundle.area == area)
-    if pricing_status:
-        stmt = stmt.where(PpaBundle.quote_status == pricing_status)
+    if region:
+        # simple contains on area name
+        stmt = stmt.where(PpaBundle.area.ilike(f"%{region}%"))
+    if quote_status:
+        stmt = stmt.where(PpaBundle.quote_status == quote_status)
     if offer_status:
         stmt = stmt.where(PpaBundle.offer_status == offer_status)
 
-    # ordering
-    order_col_map = {
-        "updated_at": PpaBundle.updated_at,
-        "id": PpaBundle.id,
-        "contract_start_date": PpaBundle.contract_start_date,
+    # filtered count (subquery over bundle ids)
+    filtered_count_stmt = sa.select(func.count()).select_from(
+        sa.select(PpaBundle.id)
+        .join(Plan, Plan.id == PpaBundle.plan_id)
+        .join(Customer, Customer.id == PpaBundle.customer_id)
+        .outerjoin(Agency, Agency.id == PpaBundle.agency_id)
+        .outerjoin(PpaProject, PpaProject.bundle_id == PpaBundle.id)
+        .outerjoin(PpaSupplyPoint, PpaSupplyPoint.bundle_id == PpaBundle.id)
+        .group_by(PpaBundle.id)
+        .where(True)  # placeholder to apply same filters
+    )
+
+    # Rebuild the same filters for the filtered_count subquery
+    filters: List[sa.ClauseElement] = []
+    if customer_id is not None:
+        filters.append(PpaBundle.customer_id == customer_id)
+    if agency_id is not None:
+        filters.append(PpaBundle.agency_id == agency_id)
+    if region:
+        filters.append(PpaBundle.area.ilike(f"%{region}%"))
+    if quote_status:
+        filters.append(PpaBundle.quote_status == quote_status)
+    if offer_status:
+        filters.append(PpaBundle.offer_status == offer_status)
+
+    if filters:
+        filtered_count_stmt = filtered_count_stmt.where(sa.and_(*filters))
+
+    filtered_count = (await session.execute(filtered_count_stmt)).scalar_one()
+
+    # sorting
+    sort_col_map = {
+        "updated_at": "last_updated",
+        "quote_request_date": "requested_at",
+        "contract_start_date": "contract_start_date",
+        "customer_name": "customer_name",
+        "plan_name": "plan_name",
     }
-    order_col = order_col_map.get(sort_by, PpaBundle.updated_at)
-    stmt = stmt.order_by(order_col.desc() if sort_order == "desc" else order_col.asc())
+    sort_col = sort_col_map.get(sort_by, "last_updated")
+    sort_expr = sa.text(f"{sort_col} {sort_order}")
+    stmt = stmt.order_by(sort_expr)
 
     # pagination
     stmt = stmt.limit(rows).offset((page - 1) * rows)
 
-    # counts
-    base_count = sa.select(func.count()).select_from(PpaBundle)
-    if customer_id is not None:
-        base_count = base_count.where(PpaBundle.customer_id == customer_id)
-    if agency_id is not None:
-        base_count = base_count.where(PpaBundle.agency_id == agency_id)
-    if area:
-        base_count = base_count.where(PpaBundle.area == area)
-    if pricing_status:
-        base_count = base_count.where(PpaBundle.quote_status == pricing_status)
-    if offer_status:
-        base_count = base_count.where(PpaBundle.offer_status == offer_status)
+    rows_rs = (await session.execute(stmt)).all()
 
-    total_count_stmt = sa.select(func.count()).select_from(PpaBundle)
-    total_count = (await session.execute(total_count_stmt)).scalar_one()
-    filtered_count = (await session.execute(base_count)).scalar_one()
+    items: List[PpaQuotationListItem] = []
+    for r in rows_rs:
+        region_id, region_name_en, region_name_jp = _region_from_area(r.area)
+        tender = _tender_number(int(r.bundle_id))
+        qv_label, exp_date = _format_quote_valid_until(r.requested_at, r.quote_valid_days)
 
-    rows_db = (await session.execute(stmt)).all()
-
-    pricing_map, offer_map = _status_maps()
-
-    data: List[PpaQuotationListItem] = []
-    for r in rows_db:
-        region_id, region_en, region_jp = _region_from_area(r.area)
-        summary = _summary_number(r.bundle_id)
-        proj_ids = list(r.proj_ids or [])
-        project_count = len([pid for pid in proj_ids if pid is not None])
-        contract_power_kw = float(r.sum_kw or 0.0)
-        sp_count = int(r.sp_count or 0)
-
-        # validity
-        valid_label, exp_date_str = _valid_until_string(r.requested_at, r.quote_valid_days)
-
-        # statuses
-        p_id, p_en, p_jp = pricing_map.get(str(r.quote_status) if r.quote_status else "DRAFT", (1, "pending", "保留中"))
-        o_id, o_en, o_jp = offer_map.get(str(r.offer_status) if r.offer_status else "NONE", (1, "pending", "保留中"))
-
-        # last updated
-        last_upd = r.updated_at
-        last_upd_str = last_upd.strftime("%Y-%m-%d %H:%M") if isinstance(last_upd, datetime) else None
-
-        data.append(
+        items.append(
             PpaQuotationListItem(
-                id=r.bundle_id,
-                tender_number=summary,
+                id=int(r.bundle_id),
+                tender_number=tender,
                 customer_name=r.customer_name,
                 plan_id=int(r.plan_id),
                 plan_name_en=r.plan_name,
-                plan_name_jp=r.plan_name,
+                plan_name_jp=r.plan_name,   # same until you have JP label
                 sales_agent_id=int(r.agency_id) if r.agency_id is not None else None,
                 sales_agent_name=r.agency_name,
                 region_id=region_id,
-                region_name_en=region_en,
-                region_name_jp=region_jp,
+                region_name_en=region_name_en,
+                region_name_jp=region_name_jp,
                 quote_request_date=r.requested_at,
                 last_date_for_quotation=r.request_due_date,
-                quote_valid_until=valid_label,
+                quote_valid_until=qv_label,
                 contract_start_date=r.contract_start_date,
-                num_of_spids=sp_count,
-                peak_demand=None,
-                annual_usage=None,
-                pricing_status_id=p_id,
-                pricing_status_en=p_en,
-                pricing_status_jp=p_jp,
-                offer_status_id=o_id,
-                offer_status_en=o_en,
-                offer_status_jp=o_jp,
-                last_updated=last_upd_str,
+                num_of_spids=int(r.sp_count or 0),
+                peak_demand=None,     # not modeled yet
+                annual_usage=None,    # not modeled yet
+                pricing_status_id=1,  # static placeholder like BizQ "pending"
+                pricing_status_en="pending",
+                pricing_status_jp="保留中",
+                offer_status_id=1,    # static placeholder like BizQ "pending"
+                offer_status_en="pending",
+                offer_status_jp="保留中",
+                last_updated=r.last_updated.strftime("%Y-%m-%d %H:%M") if isinstance(r.last_updated, datetime) else None,
                 has_quotation_file=False,
-                summary_number=summary,
-                project_count=project_count,
-                contract_power_kw=contract_power_kw,
-                expiration_date=exp_date_str,
+                # Extra columns requested for PPA view
+                summary_number=tender,                       # = tender_number for display
+                project_count=int(r.project_count or 0),     # 案件数 (per summary)
+                contract_power_kw=float(r.sum_kw or 0.0),    # 契約電力 (sum of SP.contract_kw)
+                expiration_date=exp_date,                    # 有効期限
             )
         )
 
     return PpaQuotationListResponse(
         total_count=int(total_count),
         filtered_count=int(filtered_count),
-        data=data,
+        data=items,
     )
 
 
-# --- DETAIL --------------------------------------------------------------
+# -------------------------------
+# Detail endpoint
+# -------------------------------
 
-@router.get("/{bundle_id}", response_model=PpaQuotationDetailResponse)
+@router.get("/{bundle_id}", response_model=PpaQuotationDetail)
 async def get_ppa_quotation_detail(
     bundle_id: int,
     session: AsyncSession = Depends(get_session),
 ):
-    # ---- bundle header ----
-    b_stmt = (
+    """
+    Detail view for a single PPA bundle (まとめ番号＝bundle).
+    Returns header info + list of projects (案件番号) under that bundle.
+
+    Note:
+    - PpaSupplyPoint doesn't have project_id in your schema, so per-project
+      supply-point counts are not available. We still provide bundle-level SP
+      totals and per-project capacity/IDs neatly.
+    """
+    # Header / bundle row
+    head_stmt = (
         sa.select(
             PpaBundle.id.label("bundle_id"),
             Plan.id.label("plan_id"),
@@ -261,101 +278,97 @@ async def get_ppa_quotation_detail(
             Agency.id.label("agency_id"),
             Agency.name.label("agency_name"),
             PpaBundle.area,
+            PpaBundle.contract_start_date,
             PpaBundle.requested_at,
             PpaBundle.request_due_date,
             PpaBundle.quote_valid_days,
-            PpaBundle.contract_start_date,
-            PpaBundle.quote_status,
-            PpaBundle.offer_status,
-            PpaBundle.updated_at,
+            PpaBundle.updated_at.label("last_updated"),
+            func.count(sa.distinct(PpaProject.id)).label("project_count"),
+            func.count(sa.distinct(PpaSupplyPoint.id)).label("sp_count"),
+            func.coalesce(func.sum(PpaSupplyPoint.contract_kw), 0.0).label("sum_kw"),
         )
         .join(Plan, Plan.id == PpaBundle.plan_id)
         .join(Customer, Customer.id == PpaBundle.customer_id)
         .outerjoin(Agency, Agency.id == PpaBundle.agency_id)
+        .outerjoin(PpaProject, PpaProject.bundle_id == PpaBundle.id)
+        .outerjoin(PpaSupplyPoint, PpaSupplyPoint.bundle_id == PpaBundle.id)
         .where(PpaBundle.id == bundle_id)
+        .group_by(
+            PpaBundle.id,
+            Plan.id, Plan.name,
+            Customer.name,
+            Agency.id, Agency.name,
+            PpaBundle.area,
+            PpaBundle.contract_start_date,
+            PpaBundle.requested_at,
+            PpaBundle.request_due_date,
+            PpaBundle.quote_valid_days,
+            PpaBundle.updated_at,
+        )
     )
-    b_row = (await session.execute(b_stmt)).one_or_none()
-    if not b_row:
-        from fastapi import HTTPException
+    head_row = (await session.execute(head_stmt)).one_or_none()
+    if not head_row:
         raise HTTPException(status_code=404, detail="Bundle not found")
 
-    pricing_map, offer_map = _status_maps()
-    region_id, region_en, region_jp = _region_from_area(b_row.area)
-    summary = _summary_number(b_row.bundle_id)
-    valid_label, exp_date_str = _valid_until_string(b_row.requested_at, b_row.quote_valid_days)
+    r = head_row
+    region_id, region_name_en, region_name_jp = _region_from_area(r.area)
+    tender = _tender_number(int(r.bundle_id))
+    qv_label, exp_date = _format_quote_valid_until(r.requested_at, r.quote_valid_days)
 
-    p_id, p_en, p_jp = pricing_map.get(str(b_row.quote_status) if b_row.quote_status else "DRAFT", (1, "pending", "保留中"))
-    o_id, o_en, o_jp = offer_map.get(str(b_row.offer_status) if b_row.offer_status else "NONE", (1, "pending", "保留中"))
-
-    last_upd = b_row.updated_at
-    last_upd_str = last_upd.strftime("%Y-%m-%d %H:%M") if isinstance(last_upd, datetime) else None
-
-    # ---- bundle-level SP totals (since SPs don’t link to project) ----
-    sp_totals_stmt = (
-        sa.select(
-            func.count(PpaSupplyPoint.id).label("sp_count"),
-            func.coalesce(func.sum(PpaSupplyPoint.contract_kw), 0.0).label("sum_kw"),
-        )
-        .where(PpaSupplyPoint.bundle_id == bundle_id)
-    )
-    sp_totals = (await session.execute(sp_totals_stmt)).one()
-    total_sp = int(sp_totals.sp_count or 0)
-    total_kw = float(sp_totals.sum_kw or 0.0)
-
-    # ---- projects (no SP join) ----
+    # Projects under this bundle
     proj_stmt = (
         sa.select(
             PpaProject.id.label("project_id"),
-            (func.coalesce(PpaProject.capacity_mw, 0.0) * 1000.0).label("capacity_kw"),
+            PpaProject.capacity_mw.label("capacity_mw"),
         )
         .where(PpaProject.bundle_id == bundle_id)
         .order_by(PpaProject.id.asc())
     )
     proj_rows = (await session.execute(proj_stmt)).all()
 
-    projects: List[PpaProjectBrief] = []
+    projects: List[PpaQuotationProject] = []
     for pr in proj_rows:
         projects.append(
-            PpaProjectBrief(
+            PpaQuotationProject(
                 project_id=int(pr.project_id),
-                capacity_kw=float(pr.capacity_kw or 0.0),
-                # placeholders until supply points carry a project link:
-                supply_point_count=0,
-                contract_power_kw=0.0,
+                capacity_mw=float(pr.capacity_mw or 0.0),
+                # num_of_spids: not available per project (no project_id on PpaSupplyPoint)
+                num_of_spids=None,
+                contract_power_kw=None,
             )
         )
 
-    return PpaQuotationDetailResponse(
-        id=b_row.bundle_id,
-        tender_number=summary,
-        customer_name=b_row.customer_name,
-        plan_id=int(b_row.plan_id),
-        plan_name_en=b_row.plan_name,
-        plan_name_jp=b_row.plan_name,
-        sales_agent_id=int(b_row.agency_id) if b_row.agency_id is not None else None,
-        sales_agent_name=b_row.agency_name,
+    detail = PpaQuotationDetail(
+        id=int(r.bundle_id),
+        tender_number=tender,
+        customer_name=r.customer_name,
+        plan_id=int(r.plan_id),
+        plan_name_en=r.plan_name,
+        plan_name_jp=r.plan_name,
+        sales_agent_id=int(r.agency_id) if r.agency_id is not None else None,
+        sales_agent_name=r.agency_name,
         region_id=region_id,
-        region_name_en=region_en,
-        region_name_jp=region_jp,
-        quote_request_date=b_row.requested_at,
-        last_date_for_quotation=b_row.request_due_date,
-        quote_valid_until=valid_label,
-        contract_start_date=b_row.contract_start_date,
-        num_of_spids=total_sp,
+        region_name_en=region_name_en,
+        region_name_jp=region_name_jp,
+        quote_request_date=r.requested_at,
+        last_date_for_quotation=r.request_due_date,
+        quote_valid_until=qv_label,
+        contract_start_date=r.contract_start_date,
+        num_of_spids=int(r.sp_count or 0),
         peak_demand=None,
         annual_usage=None,
-        pricing_status_id=p_id,
-        pricing_status_en=p_en,
-        pricing_status_jp=p_jp,
-        offer_status_id=o_id,
-        offer_status_en=o_en,
-        offer_status_jp=o_jp,
-        last_updated=last_upd_str,
+        pricing_status_id=1,
+        pricing_status_en="pending",
+        pricing_status_jp="保留中",
+        offer_status_id=1,
+        offer_status_en="pending",
+        offer_status_jp="保留中",
+        last_updated=r.last_updated.strftime("%Y-%m-%d %H:%M") if isinstance(r.last_updated, datetime) else None,
         has_quotation_file=False,
-        summary_number=summary,
-        project_count=len(projects),
-        contract_power_kw=total_kw,
-        expiration_date=exp_date_str,
+        summary_number=tender,
+        project_count=int(r.project_count or 0),
+        contract_power_kw=float(r.sum_kw or 0.0),
+        expiration_date=exp_date,
         projects=projects,
-        supply_points_count=total_sp,
     )
+    return detail
